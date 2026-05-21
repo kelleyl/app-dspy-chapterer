@@ -1,66 +1,84 @@
-# TO_DEVS: BURN AFTER READING
+# DSPy Chapterer
 
-Delete this section of the document once the app development is done, before publishing the repository.
+Generates an ordered list of broadcast chapters (start time, end time, title) from a MMIF containing ASR and an optional shot-boundary view. The chaptering instruction was discovered by MIPROv2 prompt optimization over silver chapter data.
 
----
-This skeleton code is a scaffolding for Python-based CLAMS app development. Specifically, it contains
+## How it works
 
-1. `app.py` and `metadata.py` to write the app
-1. `requirements.txt` to specify python dependencies
-1. `Containerfile` to containerize the app and specify system dependencies
-1. `.gitignore` and `.dockerignore` files listing commonly ignored files
-1. an empty `LICENSE` file to replace with an actual license information of the app
-1. This `README.md` file for additional information not specified in the general user manual at https://apps.clams.ai/clamsapp
-1. A number of GitHub Actions workflows for issue/bugreport management
-1. A GHA workflow to publish app images upon any push of a git tag
-   * **NOTE**: All GHA workflows included are designed to only work in repositories under `clamsproject` organization.
+1. Pulls an ASR view from the input MMIF (VibeVoice, Parakeet, or Whisper).
+2. Optionally pulls TransNet shot-boundary TimeFrames and visual-caption text.
+3. Calls an external OpenAI-compatible chat-completions endpoint (vLLM, Ollama, etc.) with a single-shot chaptering prompt.
+4. Post-processes the LLM output: clamp, sort, drop overlaps, snap each chapter start to the nearest shot change within tolerance, enforce a minimum chapter duration.
+5. Emits one MMIF `TimeFrame` per chapter (`timeUnit=milliseconds`); the chapter title is stored on the `label` property.
 
-Before pushing your first commit, please make sure to delete this section of the document.
+The default chaptering instruction was found by MIPROv2 (instruction-only, 27B proposer + 9B task model) on a 12-example silver train set. Reported on cas-2024 gold-23 (m5-generate, transcript-only):
 
-Then use the following section to document any additional information specific to this app. If your app works significantly different from what's described in the generic readme file, be as specific as possible.
+| method                                | F1@5s | Pk    |
+|---------------------------------------|------:|------:|
+| Zero-shot baseline (27B)              | 0.553 | 0.211 |
+| MIPROv2-optimized prompt (27B)        | 0.603 | 0.187 |
 
+The 27B improvement transfers from the silver train set to the gold test set; the smaller 9B model regresses slightly under the optimized prompt (cannot reliably follow the more demanding splitting instruction).
 
-> **warning**
-> TO_DEVS: Delete these `TO_DEVS` notes and warnings before publishing the repository.
+## Requirements
 
----
+- Python 3.10+
+- An external OpenAI-compatible chat-completions endpoint serving a 27B-class instruction-following model (recommended). Smaller models work but accuracy drops; the optimized prompt may regress on models below 9B.
+- The LLM endpoint must support large prompts (>32K input tokens) for full-length broadcasts.
 
-# Dspy Chapterer
+The app itself does not load any model weights; GPU is only required at the LLM endpoint.
 
-> **warning**
-> TO_DEVS: Again, delete these `TO_DEVS` notes and warnings before publishing the repository.
+## Parameters
 
-## Description
+| name                    | type    | default                            | notes |
+|-------------------------|---------|------------------------------------|-------|
+| `apiUrl`                | string  | `http://localhost:8888/v1`         | OpenAI-compatible endpoint base URL |
+| `modelName`             | string  | `Qwen/Qwen3.5-27B-GPTQ-Int4`       | Model identifier served at `apiUrl` |
+| `apiKey`                | string  | `EMPTY`                            | Bearer token; `EMPTY` for local vLLM |
+| `useOptimizedPrompt`    | boolean | `True`                             | Set False to fall back to zero-shot baseline |
+| `useShots`              | boolean | `True`                             | Snap chapter starts to TransNet shot changes |
+| `useVisualText`         | boolean | `False`                            | Include OCR / captioner views in the prompt |
+| `minChapterDurationMs`  | integer | `5000`                             | Floor on chapter duration (ms) |
+| `snapToShotWindowMs`    | integer | `3000`                             | Snap tolerance (ms) |
+| `maxTokens`             | integer | `8192`                             | LLM output budget |
+| `temperature`           | number  | `0.0`                              | LLM sampling temperature |
+| `requestTimeoutSec`     | number  | `600.0`                            | LLM request timeout (s) |
 
-> **note**
-> TO_DEVS: A brief description of the app, expected behavior, underlying software/library/technology, etc.
+## Running
 
-## User instruction
+### Local development
 
-General user instructions for CLAMS apps are available at [CLAMS Apps documentation](https://apps.clams.ai/clamsapp).
+```bash
+pip install -r requirements.txt
+python3 app.py --port 5000
+```
 
-Below is a list of additional information specific to this app.
+In another shell:
 
-> **note**
-> TO_DEVS: Below is a list of additional information specific to this app.
+```bash
+curl -X POST http://localhost:5000/ \
+  -H 'Content-Type: application/json' \
+  -d @example.mmif
+```
 
+### Docker
 
-### System requirements
+```bash
+docker build -t app-dspy-chapterer .
+docker run --rm --network=host app-dspy-chapterer  # --network=host so it can reach the LLM endpoint at localhost
+```
 
-> **note**
-> TO_DEVS: Any system-level software required to run this app. Usually include some of the following:
-> * supported OS and CPU architectures
-> * usage of GPU
-> * system package names (e.g. `ffmpeg`, `libav`, `libopencv-dev`, etc.)
-> * some example code snippet to install them on Debian/Ubuntu (because our base images are based on Debian)
->     * e.g. `apt-get update && apt-get install -y <package-name>`
+### CLI
 
-### Configurable runtime parameter
+```bash
+python3 cli.py --apiUrl http://localhost:8888/v1 --modelName Qwen/Qwen3.5-27B-GPTQ-Int4 in.mmif out.mmif
+```
 
-For the full list of parameters, please refer to the app metadata from the [CLAMS App Directory](https://apps.clams.ai) or the [`metadata.py`](metadata.py) file in this repository.
+## Output
 
-> **warning**
-> TO_DEVS: If you're not developing this app for publishing on the CLAMS App Directory, the above paragraph is not applicable. Feel free to delete or change it.
+One MMIF `TimeFrame` annotation per chapter, with:
 
-> **note**
-> TO_DEVS: all runtime parameters are supported to be VERY METICULOUSLY documented in the app's `metadata.py` file. However for some reason, if you need to use this space to elaborate what's already documented in `metadata.py`, feel free to do so.
+- `start`: int, milliseconds
+- `end`: int, milliseconds
+- `label`: string, chapter title
+
+The view is signed with all runtime parameters used for the call.
