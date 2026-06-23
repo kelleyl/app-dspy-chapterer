@@ -13,6 +13,9 @@ from mmif import Mmif
 from .types import TimedItem, VideoSignals
 
 
+DEFAULT_FPS = 29.97  # NTSC; most FuzzyMemoriesTV archival is 29.97 or 30
+
+
 def _normalize_app(uri: str) -> str:
     return (uri or "").lower()
 
@@ -22,7 +25,57 @@ def _id(s: str) -> str:
     return s.split(":", 1)[-1] if ":" in s else s
 
 
-def _extract_asr_from_view(view) -> list[TimedItem]:
+def _view_time_unit(view, type_substring: str) -> Optional[str]:
+    """Read the declared timeUnit for a given MMIF type in a view's contains
+    metadata. Returns None if not declared. `type_substring` is matched against
+    the type URI (e.g. "TimeFrame"). Lowercased."""
+    contains = (getattr(view.metadata, "contains", None) or {})
+    try:
+        items = contains.items()
+    except AttributeError:
+        items = []
+    for type_uri, type_meta in items:
+        if type_substring in str(type_uri):
+            try:
+                unit = type_meta.get("timeUnit") if hasattr(type_meta, "get") else type_meta["timeUnit"]
+            except (KeyError, TypeError):
+                unit = None
+            return unit.lower() if isinstance(unit, str) else None
+    return None
+
+
+def _video_fps(mmif: Mmif, default: float = DEFAULT_FPS) -> float:
+    """Try to read fps from the VideoDocument properties. Falls back to default."""
+    for doc in mmif.documents:
+        if "VideoDocument" not in str(doc.at_type):
+            continue
+        props = doc.properties
+        for key in ("fps", "frameRate", "frame_rate"):
+            val = props.get(key)
+            if val is None:
+                continue
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _to_ms(value, unit: Optional[str], fps: float) -> int:
+    """Convert a time value to milliseconds given its unit and the video fps."""
+    if value is None:
+        return 0
+    v = float(value)
+    u = (unit or "").lower()
+    if u in ("frame", "frames"):
+        return int(round(v * 1000.0 / fps))
+    if u in ("second", "seconds", "s"):
+        return int(round(v * 1000.0))
+    # Default and "millisecond"/"milliseconds"/"ms": assume already ms.
+    return int(round(v))
+
+
+def _extract_asr_from_view(view, fps: float) -> list[TimedItem]:
     """Pull (start_ms, end_ms, text) triples from an ASR view.
 
     Supports two common shapes:
@@ -32,7 +85,10 @@ def _extract_asr_from_view(view) -> list[TimedItem]:
         Alignment(TF↔Token). The Sentence holds the final text and a list of
         Token targets; per-token timing comes from Token↔TimeFrame alignments.
         We emit one TimedItem per Sentence covering [min token start, max end].
+
+    Reads the view's declared timeUnit for TimeFrame and converts to ms.
     """
+    tf_unit = _view_time_unit(view, "TimeFrame")
     text_blob = ""
     tfs: dict[str, tuple[int, int]] = {}
     spans: dict[str, tuple[int, int]] = {}
@@ -51,15 +107,18 @@ def _extract_asr_from_view(view) -> list[TimedItem]:
                 text_blob = text_val
         elif "TimeFrame" in atype:
             try:
-                tfs[_id(ann.id)] = (int(props["start"]), int(props["end"]))
+                tfs[_id(ann.id)] = (_to_ms(props["start"], tf_unit, fps),
+                                    _to_ms(props["end"], tf_unit, fps))
             except (KeyError, TypeError, ValueError):
                 continue
         elif atype.endswith("/Span") or "Span" in atype:
+            # Spans index into a TextDocument by char offset — these stay raw.
             try:
                 spans[_id(ann.id)] = (int(props["start"]), int(props["end"]))
             except (KeyError, TypeError, ValueError):
                 continue
         elif "Token" in atype:
+            # Tokens index into a TextDocument by char offset — these stay raw.
             try:
                 tokens[_id(ann.id)] = (int(props["start"]), int(props["end"]))
             except (KeyError, TypeError, ValueError):
@@ -115,33 +174,36 @@ def _extract_asr_from_view(view) -> list[TimedItem]:
     return items
 
 
-def extract_asr(mmif: Mmif, asr_view_match: Optional[Iterable[str]] = None) -> list[TimedItem]:
+def extract_asr(mmif: Mmif, fps: float,
+                asr_view_match: Optional[Iterable[str]] = None) -> list[TimedItem]:
     """Find the first ASR view whose app URI contains any of `asr_view_match`
     substrings (case-insensitive). Defaults: vibevoice, parakeet, whisper."""
     matches = asr_view_match or ("vibevoice", "parakeet", "whisper")
     for view in mmif.views:
         app = _normalize_app(view.metadata.app or "")
         if any(m in app for m in matches):
-            items = _extract_asr_from_view(view)
+            items = _extract_asr_from_view(view, fps)
             if items:
                 return items
     return []
 
 
-def extract_shots(mmif: Mmif) -> list[TimedItem]:
-    """Find TimeFrames from a transnet shot-detection view."""
+def extract_shots(mmif: Mmif, fps: float) -> list[TimedItem]:
+    """Find TimeFrames from a transnet shot-detection view, converting from
+    the view's declared timeUnit (frame|second|ms) to milliseconds."""
     out: list[TimedItem] = []
     for view in mmif.views:
         app = _normalize_app(view.metadata.app or "")
         if "transnet" not in app and "shot" not in app:
             continue
+        unit = _view_time_unit(view, "TimeFrame")
         for ann in view.annotations:
             atype = str(ann.at_type)
             if "TimeFrame" not in atype:
                 continue
             try:
-                start = int(ann.properties["start"])
-                end = int(ann.properties["end"])
+                start = _to_ms(ann.properties["start"], unit, fps)
+                end = _to_ms(ann.properties["end"], unit, fps)
             except (KeyError, TypeError, ValueError):
                 continue
             label = ann.properties.get("label") or ann.properties.get("frameType") or "shot change"
@@ -150,7 +212,7 @@ def extract_shots(mmif: Mmif) -> list[TimedItem]:
     return out
 
 
-def extract_visual_text(mmif: Mmif) -> list[TimedItem]:
+def extract_visual_text(mmif: Mmif, fps: float) -> list[TimedItem]:
     """Pull chyron/slate/credits OCR or per-shot caption text from any
     view whose app produces them. Best-effort, missing views just skipped."""
     out: list[TimedItem] = []
@@ -158,6 +220,8 @@ def extract_visual_text(mmif: Mmif) -> list[TimedItem]:
         app = _normalize_app(view.metadata.app or "")
         if not any(m in app for m in ("captioner", "ocr", "qwen3vl", "smolvlm")):
             continue
+        tf_unit = _view_time_unit(view, "TimeFrame")
+        tp_unit = _view_time_unit(view, "TimePoint")
         for ann in view.annotations:
             atype = str(ann.at_type)
             if "TextDocument" in atype:
@@ -165,9 +229,10 @@ def extract_visual_text(mmif: Mmif) -> list[TimedItem]:
             if "TimeFrame" not in atype and "TimePoint" not in atype:
                 continue
             props = ann.properties
+            unit = tp_unit if "TimePoint" in atype else tf_unit
             try:
-                start = int(props["start"])
-                end = int(props.get("end", start))
+                start = _to_ms(props["start"], unit, fps)
+                end = _to_ms(props.get("end", props["start"]), unit, fps)
             except (KeyError, TypeError, ValueError):
                 continue
             text = props.get("text") or props.get("transcription") or props.get("label") or ""
@@ -205,11 +270,19 @@ def build_signals(
     duration_ms: int = 0,
     include_visual: bool = False,
     include_shots: bool = False,
+    fps: Optional[float] = None,
 ) -> VideoSignals:
-    asr = extract_asr(mmif)
+    """Build a VideoSignals from a MMIF.
+
+    fps: video frame rate, used to convert any frame-unit TimeFrames to ms.
+         If None, read from the VideoDocument (fps/frameRate/frame_rate
+         property) or fall back to DEFAULT_FPS (29.97).
+    """
+    f = fps if fps is not None else _video_fps(mmif)
+    asr = extract_asr(mmif, f)
     dur = duration_ms or video_duration_ms(mmif) or (asr[-1].end_ms if asr else 0)
-    shots = extract_shots(mmif) if (include_shots or include_visual) else []
-    visual = extract_visual_text(mmif) if include_visual else []
+    shots = extract_shots(mmif, f) if (include_shots or include_visual) else []
+    visual = extract_visual_text(mmif, f) if include_visual else []
     return VideoSignals(
         duration_ms=dur,
         asr=asr,
