@@ -80,11 +80,8 @@ class M5GenerateRecipe(dspy.Module):
             visual_text=visual_text,
         )
 
-        shot_change_times = [
-            it.start_ms
-            for it in signals.swt_timeframes
-            if "shot change" in (it.text or "").lower()
-        ]
+        # Each TransNet shot-boundary TimeFrame is a shot-change candidate.
+        shot_change_times = [it.start_ms for it in signals.swt_timeframes]
 
         return self._postprocess(
             getattr(result, "chapters", []) or [],

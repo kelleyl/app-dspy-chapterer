@@ -23,31 +23,53 @@ def _id(s: str) -> str:
 
 
 def _extract_asr_from_view(view) -> list[TimedItem]:
-    """Pull (start_ms, end_ms, text) triples from an ASR-ish view.
+    """Pull (start_ms, end_ms, text) triples from an ASR view.
 
-    Expected layout: one TextDocument, one or more TimeFrames with start/end,
-    Spans into the text document, and Alignments linking TimeFrame to Span.
+    Supports two common shapes:
+      * VibeVoice-style: TextDocument + TimeFrame + Span + Alignment(TF↔Span).
+        The Span holds char offsets into the TextDocument.
+      * Parakeet-style:  TextDocument + TimeFrame + Token + Sentence +
+        Alignment(TF↔Token). The Sentence holds the final text and a list of
+        Token targets; per-token timing comes from Token↔TimeFrame alignments.
+        We emit one TimedItem per Sentence covering [min token start, max end].
     """
     text_blob = ""
     tfs: dict[str, tuple[int, int]] = {}
     spans: dict[str, tuple[int, int]] = {}
+    tokens: dict[str, tuple[int, int]] = {}
+    sentences: list[dict] = []
     aligns: dict[str, str] = {}
 
     for ann in view.annotations:
         atype = str(ann.at_type)
         props = ann.properties
         if "TextDocument" in atype:
-            text_blob = props.get("text", {}).get("@value", text_blob) or text_blob
+            text_val = props.get("text")
+            if isinstance(text_val, dict):
+                text_blob = text_val.get("@value", text_blob) or text_blob
+            elif isinstance(text_val, str):
+                text_blob = text_val
         elif "TimeFrame" in atype:
             try:
-                tfs[ann.id] = (int(props["start"]), int(props["end"]))
+                tfs[_id(ann.id)] = (int(props["start"]), int(props["end"]))
             except (KeyError, TypeError, ValueError):
                 continue
         elif atype.endswith("/Span") or "Span" in atype:
             try:
-                spans[ann.id] = (int(props["start"]), int(props["end"]))
+                spans[_id(ann.id)] = (int(props["start"]), int(props["end"]))
             except (KeyError, TypeError, ValueError):
                 continue
+        elif "Token" in atype:
+            try:
+                tokens[_id(ann.id)] = (int(props["start"]), int(props["end"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        elif "Sentence" in atype:
+            sentences.append({
+                "id": _id(ann.id),
+                "text": props.get("text", "") or "",
+                "targets": [_id(str(t)) for t in props.get("targets", []) or []],
+            })
         elif "Alignment" in atype:
             src = props.get("source")
             tgt = props.get("target")
@@ -56,11 +78,32 @@ def _extract_asr_from_view(view) -> list[TimedItem]:
                 aligns[_id(str(tgt))] = _id(str(src))
 
     items: list[TimedItem] = []
+
+    # Parakeet-style: aggregate Tokens into Sentences using time bounds.
+    if sentences and tokens:
+        for sent in sentences:
+            ts = []
+            for tok_id in sent["targets"]:
+                tf_id = aligns.get(tok_id)
+                if tf_id and tf_id in tfs:
+                    ts.append(tfs[tf_id])
+            if not ts:
+                continue
+            start = min(t[0] for t in ts)
+            end = max(t[1] for t in ts)
+            text = (sent["text"] or "").strip()
+            if not text:
+                continue
+            items.append(TimedItem(start_ms=start, end_ms=end, text=" ".join(text.split())))
+        items.sort(key=lambda x: (x.start_ms, x.end_ms))
+        return items
+
+    # VibeVoice-style: TimeFrame ↔ Span ↔ TextDocument slicing.
     for tf_id, (start, end) in tfs.items():
-        target = aligns.get(tf_id) or aligns.get(_id(tf_id))
+        target = aligns.get(tf_id)
         if not target:
             continue
-        span = spans.get(target) or spans.get(_id(target))
+        span = spans.get(target)
         if not span:
             continue
         s, e = span
