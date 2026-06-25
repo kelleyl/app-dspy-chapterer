@@ -138,9 +138,33 @@ def appmetadata() -> AppMetadata:
         name="skipTitling",
         type="boolean",
         default=False,
-        description="When `decoupledBoundaries=True`, skip the per-chapter title "
-                    "pass and emit empty `label` properties. Useful for "
-                    "boundary-only evaluation.",
+        description="When `decoupledBoundaries=True` or `interleavedEvents=True`, "
+                    "skip the per-chapter title pass and emit empty `label` "
+                    "properties. Useful for boundary-only evaluation.",
+    )
+    metadata.add_parameter(
+        name="interleavedEvents",
+        type="boolean",
+        default=False,
+        description="Use the M5InterleavedRecipe: feed the LLM a single "
+                    "time-sorted event stream (ASR + visual captions + speaker "
+                    "changes + pauses + acoustic tags) and ask it to output "
+                    "boundary line indices instead of millisecond timestamps. "
+                    "Takes precedence over `decoupledBoundaries` when both are True.",
+    )
+    metadata.add_parameter(
+        name="useSpeakers",
+        type="boolean",
+        default=False,
+        description="Include diarized speaker-change events in the event stream "
+                    "(requires a VibeVoice view in the input MMIF).",
+    )
+    metadata.add_parameter(
+        name="useAcousticEvents",
+        type="boolean",
+        default=False,
+        description="Include acoustic-event tags (e.g. [Music], [Noise]) parsed "
+                    "from the VibeVoice transcript in the event stream.",
     )
 
     return metadata

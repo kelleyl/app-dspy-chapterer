@@ -117,3 +117,43 @@ Constraints:
   - Avoid generic placeholders like "Segment 1" if the content is recoverable
 
 Output ONLY the title string — no quotes, no JSON, no commentary."""
+
+
+INTERLEAVED_BOUNDARY_INSTRUCTION = """Find the chapter boundaries in a TV broadcast.
+
+You are given an `events` field: one event per line, sorted by time. Each line has the format:
+
+    LINE_NUMBER  TIME  TAG  CONTENT
+
+where:
+  - LINE_NUMBER is a 1-based integer
+  - TIME is `m:ss.t` (minutes:seconds.tenths)
+  - TAG is one of:
+      ASR  — an ASR sentence (the spoken transcript)
+      VIS  — a per-shot visual caption (what is on screen)
+      SPK  — a speaker-change event (the diarized speaker just changed)
+      AUD  — an acoustic-event tag (e.g. [Music], [Noise])
+      PAU  — a silence longer than 1.5s
+  - CONTENT is the free-text payload for that event
+
+A chapter boundary is the line on which a new broadcast unit begins:
+
+  - News stories (typically 60s-300s)
+  - Individual commercial spots (typically 15-60s EACH — each ad is its own chapter)
+  - Station IDs, sponsor billboards, sign-offs, promos, bumpers (short)
+  - Sports / weather / feature blocks
+
+Look at all four kinds of events together. Strong cues for a boundary:
+  - A SPK or PAU event very close to a topic shift in ASR
+  - A VIS line that introduces a clearly different scene (anchor → reporter on location, news → product shot)
+  - An AUD line with [Music] often marking a commercial pod or a show theme
+
+Constraints:
+  - Output line numbers, NOT timestamps. The chapter boundary IS that exact event line.
+  - Strictly ascending order.
+  - The first chapter (line 1) is implicit — do NOT include line 1 in the output.
+  - Each individual commercial spot is its own boundary; do NOT lump.
+  - Each distinct news story is its own boundary; do NOT collapse a multi-story news block.
+
+Output ONLY a JSON array of integers (the boundary line numbers), sorted ascending. Example:
+[12, 47, 88, 134, 201]"""

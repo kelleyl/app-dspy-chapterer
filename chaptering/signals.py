@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 
 from mmif import Mmif
 
-from .types import TimedItem, VideoSignals
+from .types import SpeakerSegment, TimedItem, VideoSignals
 
 
 DEFAULT_FPS = 29.97  # NTSC; most FuzzyMemoriesTV archival is 29.97 or 30
@@ -318,6 +318,142 @@ def extract_visual_text(mmif: Mmif, fps: float) -> list[TimedItem]:
     return out
 
 
+import re
+
+_ACOUSTIC_TAG_RE = re.compile(r"\[([A-Z][A-Za-z][A-Za-z ]+)\]")
+
+
+def extract_speaker_segments(mmif: Mmif, fps: float) -> list[SpeakerSegment]:
+    """Pull diarized speech segments from a VibeVoice ASR view. Returns
+    one SpeakerSegment per TimeFrame that carries a `speaker` property."""
+    out: list[SpeakerSegment] = []
+    for view in mmif.views:
+        app = _normalize_app(view.metadata.app or "")
+        if "vibevoice" not in app:
+            continue
+        unit = _view_time_unit(view, "TimeFrame")
+
+        # Build text-doc lookup once per view in case we want to slice
+        # the transcript for each segment via Span.
+        td_text = ""
+        spans: dict[str, tuple[int, int]] = {}
+        for ann in view.annotations:
+            atype = str(ann.at_type)
+            if "TextDocument" in atype:
+                td_text = _unwrap_text(ann.properties.get("text"))
+            elif atype.endswith("/Span") or "Span" in atype:
+                try:
+                    spans[_id(ann.id)] = (int(ann.properties["start"]),
+                                          int(ann.properties["end"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        # Build TimeFrame -> Span alignment lookup
+        aligns: dict[str, str] = {}
+        for ann in view.annotations:
+            if "Alignment" not in str(ann.at_type):
+                continue
+            src = _id(str(ann.properties.get("source", "")))
+            tgt = _id(str(ann.properties.get("target", "")))
+            aligns[src] = tgt
+            aligns[tgt] = src
+
+        for ann in view.annotations:
+            if "TimeFrame" not in str(ann.at_type):
+                continue
+            props = ann.properties
+            try:
+                start = _to_ms(props["start"], unit, fps)
+                end = _to_ms(props["end"], unit, fps)
+            except (KeyError, TypeError, ValueError):
+                continue
+            speaker_raw = props.get("speaker") or props.get("label")
+            speaker = str(speaker_raw).strip() if speaker_raw else ""
+            if not speaker:
+                continue
+            # Best-effort transcript slice via Span
+            text = ""
+            span_id = aligns.get(_id(ann.id))
+            if span_id and span_id in spans and td_text:
+                s, e = spans[span_id]
+                text = td_text[s:e].strip()
+            out.append(SpeakerSegment(start_ms=start, end_ms=end,
+                                      speaker=speaker, text=text))
+        if out:
+            break
+    out.sort(key=lambda x: x.start_ms)
+    return out
+
+
+def extract_acoustic_events(mmif: Mmif, fps: float) -> list[TimedItem]:
+    """Parse inline acoustic tags (e.g. `[Music]`, `[Noise]`,
+    `[Unintelligible Speech]`) from a VibeVoice transcript. Emit one
+    TimedItem per tag occurrence, using the timing of the containing
+    speech segment."""
+    out: list[TimedItem] = []
+    for view in mmif.views:
+        app = _normalize_app(view.metadata.app or "")
+        if "vibevoice" not in app:
+            continue
+        unit = _view_time_unit(view, "TimeFrame")
+
+        td_text = ""
+        for ann in view.annotations:
+            if "TextDocument" in str(ann.at_type):
+                td_text = _unwrap_text(ann.properties.get("text"))
+                break
+        if not td_text:
+            continue
+
+        spans: dict[str, tuple[int, int]] = {}
+        for ann in view.annotations:
+            if "Span" in str(ann.at_type):
+                try:
+                    spans[_id(ann.id)] = (int(ann.properties["start"]),
+                                          int(ann.properties["end"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        tfs: dict[str, tuple[int, int]] = {}
+        for ann in view.annotations:
+            if "TimeFrame" in str(ann.at_type):
+                try:
+                    tfs[_id(ann.id)] = (_to_ms(ann.properties["start"], unit, fps),
+                                        _to_ms(ann.properties["end"], unit, fps))
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+        aligns: dict[str, str] = {}
+        for ann in view.annotations:
+            if "Alignment" not in str(ann.at_type):
+                continue
+            src = _id(str(ann.properties.get("source", "")))
+            tgt = _id(str(ann.properties.get("target", "")))
+            aligns[src] = tgt
+            aligns[tgt] = src
+
+        # Scan transcript for acoustic tags, find which Span contains
+        # each match's character offset, then map Span -> TimeFrame.
+        for m in _ACOUSTIC_TAG_RE.finditer(td_text):
+            tag = m.group(0)
+            char_off = m.start()
+            owning_span_id = None
+            for sp_id, (s, e) in spans.items():
+                if s <= char_off < e:
+                    owning_span_id = sp_id
+                    break
+            if not owning_span_id:
+                continue
+            tf_id = aligns.get(owning_span_id)
+            if tf_id and tf_id in tfs:
+                start, end = tfs[tf_id]
+                out.append(TimedItem(start_ms=start, end_ms=end, text=tag))
+        if out:
+            break
+    out.sort(key=lambda x: x.start_ms)
+    return out
+
+
 def video_duration_ms(mmif: Mmif) -> int:
     """Try to read the video duration. Fall back to max ASR end_ms when
     no duration is recorded on the VideoDocument."""
@@ -342,6 +478,8 @@ def build_signals(
     duration_ms: int = 0,
     include_visual: bool = False,
     include_shots: bool = False,
+    include_speakers: bool = False,
+    include_acoustic: bool = False,
     fps: Optional[float] = None,
 ) -> VideoSignals:
     """Build a VideoSignals from a MMIF.
@@ -355,10 +493,14 @@ def build_signals(
     dur = duration_ms or video_duration_ms(mmif) or (asr[-1].end_ms if asr else 0)
     shots = extract_shots(mmif, f) if (include_shots or include_visual) else []
     visual = extract_visual_text(mmif, f) if include_visual else []
+    speakers = extract_speaker_segments(mmif, f) if include_speakers else []
+    acoustic = extract_acoustic_events(mmif, f) if include_acoustic else []
     return VideoSignals(
         duration_ms=dur,
         asr=asr,
         swt_timeframes=shots,
         chyron_ocr=[],
         visual_captions=visual,
+        speaker_segments=speakers,
+        acoustic_events=acoustic,
     )

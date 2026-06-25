@@ -22,6 +22,7 @@ from chaptering.recipe import (
     DEFAULT_SNAP_TO_SHOT_WINDOW_MS,
     M5BoundariesRecipe,
     M5GenerateRecipe,
+    M5InterleavedRecipe,
 )
 from chaptering.signals import build_signals
 
@@ -51,11 +52,16 @@ class DspyChapterer(ClamsApp):
         request_timeout: float = float(cfg["requestTimeoutSec"])
         decoupled: bool = cfg.get("decoupledBoundaries", False)
         skip_titling: bool = cfg.get("skipTitling", False)
+        interleaved: bool = cfg.get("interleavedEvents", False)
+        include_speakers: bool = cfg.get("useSpeakers", False)
+        include_acoustic: bool = cfg.get("useAcousticEvents", False)
 
         self.logger.info(
             f"DspyChapterer: model={model_name} endpoint={api_url} "
             f"optimized={use_optimized} shots={include_shots} visual={include_visual} "
-            f"decoupled={decoupled} skip_titling={skip_titling}"
+            f"decoupled={decoupled} interleaved={interleaved} "
+            f"speakers={include_speakers} acoustic={include_acoustic} "
+            f"skip_titling={skip_titling}"
         )
 
         lm = dspy.LM(
@@ -74,7 +80,13 @@ class DspyChapterer(ClamsApp):
         else:
             ChapterGeneration.__doc__ = OPTIMIZED_INSTRUCTION
 
-        if decoupled:
+        if interleaved:
+            recipe = M5InterleavedRecipe(
+                min_chapter_duration_ms=min_dur_ms,
+                snap_to_shot_window_ms=snap_window_ms if include_shots else 0,
+                skip_titling=skip_titling,
+            )
+        elif decoupled:
             recipe = M5BoundariesRecipe(
                 min_chapter_duration_ms=min_dur_ms,
                 snap_to_shot_window_ms=snap_window_ms if include_shots else 0,
@@ -88,8 +100,10 @@ class DspyChapterer(ClamsApp):
 
         signals = build_signals(
             mmif,
-            include_visual=include_visual,
+            include_visual=include_visual or interleaved,
             include_shots=include_shots,
+            include_speakers=include_speakers or interleaved,
+            include_acoustic=include_acoustic or interleaved,
         )
         if not signals.asr:
             self.logger.warning("DspyChapterer: no ASR found in input MMIF; emitting empty view")

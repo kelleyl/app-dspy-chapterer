@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 
-from .types import TimedItem
+from .types import SpeakerSegment, TimedItem
 
 
 # Phrases captioners stick on the front of every description. Stripping
@@ -106,3 +106,94 @@ def format_timed_items_for_prompt(items: list[TimedItem]) -> str:
             continue
         lines.append(f"[{int(it.start_ms)}-{int(it.end_ms)}] {text}")
     return "\n".join(lines)
+
+
+# ----- Interleaved-events format (Chapter-Llama-inspired) ----------------
+
+def _fmt_mmss(ms: int) -> str:
+    """Format ms as `m:ss.t` (minutes:seconds.tenths) — compact."""
+    total = max(0, int(ms))
+    m, rem = divmod(total, 60_000)
+    s = rem // 1000
+    t = (rem % 1000) // 100
+    return f"{m}:{s:02d}.{t}"
+
+
+def _detect_pauses(
+    asr: list[TimedItem],
+    min_gap_ms: int = 1500,
+) -> list[tuple[int, str]]:
+    """Detect silence gaps between consecutive ASR sentences. Returns list
+    of (start_ms, message) pairs to inject as `[PAUSE Xs]` events."""
+    out = []
+    for prev, nxt in zip(asr, asr[1:]):
+        gap = nxt.start_ms - prev.end_ms
+        if gap >= min_gap_ms:
+            out.append((prev.end_ms, f"PAUSE {gap / 1000:.1f}s"))
+    return out
+
+
+def _detect_speaker_changes(
+    segments: list[SpeakerSegment],
+) -> list[tuple[int, str]]:
+    """For each speaker boundary, emit a `speaker change: SPEAKER_A -> SPEAKER_B` event."""
+    out = []
+    for prev, nxt in zip(segments, segments[1:]):
+        if prev.speaker != nxt.speaker and prev.speaker and nxt.speaker:
+            out.append((nxt.start_ms, f"speaker change: {prev.speaker} -> {nxt.speaker}"))
+    return out
+
+
+def format_events_interleaved(
+    asr: list[TimedItem],
+    visual_captions: list[TimedItem],
+    speaker_segments: list[SpeakerSegment] | None = None,
+    acoustic_events: list[TimedItem] | None = None,
+    include_pauses: bool = True,
+    pause_min_gap_ms: int = 1500,
+) -> tuple[str, list[int]]:
+    """Build one sorted, numbered event stream that interleaves ASR
+    sentences, visual captions, speaker changes, pauses, and any acoustic
+    event tags.
+
+    Returns:
+        (text, line_to_ms): the formatted multi-line string, and a
+        parallel list mapping each line index (1-based, matching the
+        prefix in the formatted output) to its time in ms. Use this to
+        translate model output line indices back to chapter boundary
+        times.
+    """
+    events: list[tuple[int, str, str]] = []  # (start_ms, tag, content)
+
+    for it in asr:
+        txt = (it.text or "").strip().replace("\n", " ")
+        if txt:
+            events.append((it.start_ms, "ASR", txt))
+
+    for it in visual_captions:
+        txt = (it.text or "").strip().replace("\n", " ")
+        if txt:
+            events.append((it.start_ms, "VIS", txt))
+
+    if speaker_segments:
+        for s_ms, msg in _detect_speaker_changes(speaker_segments):
+            events.append((s_ms, "SPK", msg))
+
+    if acoustic_events:
+        for it in acoustic_events:
+            txt = (it.text or "").strip()
+            if txt:
+                events.append((it.start_ms, "AUD", txt))
+
+    if include_pauses and asr:
+        for s_ms, msg in _detect_pauses(asr, min_gap_ms=pause_min_gap_ms):
+            events.append((s_ms, "PAU", msg))
+
+    events.sort(key=lambda e: (e[0], e[1]))
+
+    lines = []
+    line_to_ms: list[int] = [0]  # 1-based, so index 0 is unused
+    for i, (ms, tag, content) in enumerate(events, start=1):
+        lines.append(f"{i:>4} {_fmt_mmss(ms):>7} {tag} {content}")
+        line_to_ms.append(ms)
+    return "\n".join(lines), line_to_ms

@@ -15,6 +15,16 @@ class TimedItem:
 
 
 @dataclass
+class SpeakerSegment:
+    """A speech segment with diarized speaker label."""
+
+    start_ms: int
+    end_ms: int
+    speaker: str           # e.g. "SPEAKER_0"
+    text: str
+
+
+@dataclass
 class Chapter:
     """A predicted chapter with start/end (ms) and a title."""
 
@@ -32,3 +42,5 @@ class VideoSignals:
     swt_timeframes: list[TimedItem] = field(default_factory=list)
     chyron_ocr: list[TimedItem] = field(default_factory=list)
     visual_captions: list[TimedItem] = field(default_factory=list)
+    speaker_segments: list[SpeakerSegment] = field(default_factory=list)
+    acoustic_events: list[TimedItem] = field(default_factory=list)

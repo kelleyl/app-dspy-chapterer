@@ -25,8 +25,17 @@ from typing import Iterable
 import dspy
 from pydantic import BaseModel, Field
 
-from .formatting import compact_captions, format_timed_items_for_prompt
-from .prompts import BOUNDARY_INSTRUCTION, OPTIMIZED_INSTRUCTION, TITLING_INSTRUCTION
+from .formatting import (
+    compact_captions,
+    format_events_interleaved,
+    format_timed_items_for_prompt,
+)
+from .prompts import (
+    BOUNDARY_INSTRUCTION,
+    INTERLEAVED_BOUNDARY_INSTRUCTION,
+    OPTIMIZED_INSTRUCTION,
+    TITLING_INSTRUCTION,
+)
 from .snap import snap_boundaries_to_shots
 from .types import Chapter, TimedItem, VideoSignals
 
@@ -310,6 +319,134 @@ class M5BoundariesRecipe(dspy.Module):
             if b - kept[-1] >= self.min_chapter_duration_ms:
                 kept.append(b)
         # Also require the final chapter to be at least min_duration long.
+        while kept and (duration_ms - kept[-1]) < self.min_chapter_duration_ms:
+            kept.pop()
+        return kept
+
+
+# ----- Interleaved-event, line-index recipe ----------------------------
+
+
+class BoundaryDetectionByLineIndex(dspy.Signature):
+    __doc__ = INTERLEAVED_BOUNDARY_INSTRUCTION
+
+    duration_ms: int = dspy.InputField(desc="total video duration in ms")
+    events: str = dspy.InputField(
+        desc="numbered, time-sorted multimodal event stream; one event per line"
+    )
+    boundary_lines: list[int] = dspy.OutputField(
+        desc="line numbers (from the events field) where a new chapter begins; "
+             "do NOT include 1 (the first chapter is implicit)"
+    )
+
+
+class M5InterleavedRecipe(dspy.Module):
+    """Chapter boundary detection over an interleaved ASR+visual+speaker+pause
+    event stream. The model emits boundary LINE NUMBERS (not millisecond
+    timestamps); we translate each line number back to its underlying time
+    via the line-to-ms map we built when formatting the events.
+
+    Title generation is decoupled (same per-chapter ChapterTitling pass as
+    M5BoundariesRecipe). Set `skip_titling=True` to return empty titles.
+    """
+
+    def __init__(
+        self,
+        min_chapter_duration_ms: int = DEFAULT_MIN_CHAPTER_DURATION_MS,
+        snap_to_shot_window_ms: int = DEFAULT_SNAP_TO_SHOT_WINDOW_MS,
+        skip_titling: bool = False,
+        include_pauses: bool = True,
+        pause_min_gap_ms: int = 1500,
+    ):
+        super().__init__()
+        self.detect_boundaries = dspy.Predict(BoundaryDetectionByLineIndex)
+        self.title_chapter = dspy.Predict(ChapterTitling)
+        self.min_chapter_duration_ms = max(0, int(min_chapter_duration_ms))
+        self.snap_to_shot_window_ms = max(0, int(snap_to_shot_window_ms))
+        self.skip_titling = bool(skip_titling)
+        self.include_pauses = bool(include_pauses)
+        self.pause_min_gap_ms = int(pause_min_gap_ms)
+
+    def forward(self, signals: VideoSignals) -> list[Chapter]:
+        if signals.duration_ms <= 0:
+            return []
+
+        compacted_captions = compact_captions(
+            list(signals.chyron_ocr) + list(signals.visual_captions)
+        )
+        events_text, line_to_ms = format_events_interleaved(
+            asr=signals.asr,
+            visual_captions=compacted_captions,
+            speaker_segments=signals.speaker_segments,
+            acoustic_events=signals.acoustic_events,
+            include_pauses=self.include_pauses,
+            pause_min_gap_ms=self.pause_min_gap_ms,
+        )
+
+        result = self.detect_boundaries(
+            duration_ms=signals.duration_ms,
+            events=events_text,
+        )
+        raw_lines = getattr(result, "boundary_lines", []) or []
+
+        # Translate line indices -> ms. Drop indices outside the valid
+        # range and the line-1 (implicit start) entry if the model emitted it.
+        max_line = len(line_to_ms) - 1
+        boundary_ms: list[int] = []
+        for v in raw_lines:
+            try:
+                line = int(v)
+            except (TypeError, ValueError):
+                continue
+            if line <= 1 or line > max_line:
+                continue
+            boundary_ms.append(line_to_ms[line])
+
+        boundary_ms = self._clean_boundaries(boundary_ms, signals.duration_ms)
+
+        shot_change_times = [it.start_ms for it in signals.swt_timeframes]
+        if self.snap_to_shot_window_ms > 0 and shot_change_times and boundary_ms:
+            snapped = snap_boundaries_to_shots(
+                boundary_ms, shot_change_times,
+                tolerance_ms=self.snap_to_shot_window_ms,
+            )
+            boundary_ms = self._clean_boundaries(snapped, signals.duration_ms)
+
+        starts = [0] + boundary_ms
+        ends = boundary_ms + [signals.duration_ms]
+
+        chapters: list[Chapter] = []
+        visual_items = list(signals.chyron_ocr) + list(signals.visual_captions)
+        for s, e in zip(starts, ends):
+            if e <= s:
+                continue
+            if self.skip_titling:
+                title = ""
+            else:
+                chapter_asr = format_timed_items_for_prompt(
+                    _items_in_range(signals.asr, s, e)
+                )
+                chapter_visual = format_timed_items_for_prompt(
+                    _items_in_range(visual_items, s, e)
+                )
+                title_result = self.title_chapter(
+                    chapter_start_ms=s,
+                    chapter_end_ms=e,
+                    asr_text=chapter_asr or "[no ASR]",
+                    visual_text=chapter_visual or "[no visual]",
+                )
+                title = (getattr(title_result, "title", "") or "").strip()
+            chapters.append(Chapter(start=s, end=e, title=title))
+        return chapters
+
+    def _clean_boundaries(self, raw, duration_ms: int) -> list[int]:
+        cleaned = sorted({max(0, min(duration_ms, int(b))) for b in raw if 0 < int(b) < duration_ms})
+        if not cleaned or self.min_chapter_duration_ms <= 0:
+            return cleaned
+        kept = [cleaned[0]]
+        for b in cleaned[1:]:
+            if b - kept[-1] >= self.min_chapter_duration_ms:
+                kept.append(b)
         while kept and (duration_ms - kept[-1]) < self.min_chapter_duration_ms:
             kept.pop()
         return kept
