@@ -20,6 +20,7 @@ from chaptering.recipe import (
     ChapterGeneration,
     DEFAULT_MIN_CHAPTER_DURATION_MS,
     DEFAULT_SNAP_TO_SHOT_WINDOW_MS,
+    M5BoundariesRecipe,
     M5GenerateRecipe,
 )
 from chaptering.signals import build_signals
@@ -48,10 +49,13 @@ class DspyChapterer(ClamsApp):
         max_tokens: int = int(cfg["maxTokens"])
         temperature: float = float(cfg["temperature"])
         request_timeout: float = float(cfg["requestTimeoutSec"])
+        decoupled: bool = cfg.get("decoupledBoundaries", False)
+        skip_titling: bool = cfg.get("skipTitling", False)
 
         self.logger.info(
             f"DspyChapterer: model={model_name} endpoint={api_url} "
-            f"optimized={use_optimized} shots={include_shots} visual={include_visual}"
+            f"optimized={use_optimized} shots={include_shots} visual={include_visual} "
+            f"decoupled={decoupled} skip_titling={skip_titling}"
         )
 
         lm = dspy.LM(
@@ -70,10 +74,17 @@ class DspyChapterer(ClamsApp):
         else:
             ChapterGeneration.__doc__ = OPTIMIZED_INSTRUCTION
 
-        recipe = M5GenerateRecipe(
-            min_chapter_duration_ms=min_dur_ms,
-            snap_to_shot_window_ms=snap_window_ms if include_shots else 0,
-        )
+        if decoupled:
+            recipe = M5BoundariesRecipe(
+                min_chapter_duration_ms=min_dur_ms,
+                snap_to_shot_window_ms=snap_window_ms if include_shots else 0,
+                skip_titling=skip_titling,
+            )
+        else:
+            recipe = M5GenerateRecipe(
+                min_chapter_duration_ms=min_dur_ms,
+                snap_to_shot_window_ms=snap_window_ms if include_shots else 0,
+            )
 
         signals = build_signals(
             mmif,

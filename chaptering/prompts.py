@@ -73,3 +73,47 @@ Example:
 ```
 
 Begin your analysis now based on the provided signals."""
+
+
+BOUNDARY_INSTRUCTION = """Find every natural chapter boundary in a TV broadcast.
+
+You are given:
+  - `duration_ms`: total video duration in ms
+  - `asr_text`: full transcript with timestamps inline (format: `[start_ms-end_ms] sentence`)
+  - `visual_text`: visual signals (chyron OCR, scene labels, captions, shot-change markers) with timestamps; may be empty
+
+A "boundary" is the START_MS of a new chapter. Output ordered start times only — do NOT output `0` (the first chapter implicitly starts there) and do NOT output `duration_ms` (the last chapter implicitly ends there).
+
+Look for transitions between:
+  - News stories (typically 60s-300s)
+  - Individual commercial spots (typically 15-60s EACH — each ad gets its own boundary)
+  - Station IDs, sponsor billboards, sign-offs (short)
+  - Sports highlights, weather reports, feature segments
+  - Promos and bumpers
+
+Constraints:
+  - Strictly increasing
+  - Each value strictly between 0 and `duration_ms`
+  - Minimum spacing of 5000ms between consecutive boundaries
+  - DO NOT lump consecutive commercial spots; each commercial gets its own boundary
+
+Output ONLY a JSON array of integers, sorted ascending. Example:
+[3690, 12450, 41100, 71300, 102050]"""
+
+
+TITLING_INSTRUCTION = """Generate a short descriptive title for one TV broadcast chapter.
+
+You are given:
+  - `chapter_start_ms` / `chapter_end_ms`: chapter time range
+  - `asr_text`: ASR sentences within the chapter's time range (may be empty)
+  - `visual_text`: visual signals within the chapter's time range (may be empty)
+
+Constraints:
+  - 3-15 words
+  - Specific: mention brands for commercials, topics for news stories, names for interviewees
+  - For commercials, lead with "Commercial: <brand>" when the brand is identifiable
+  - For news stories, summarize the story topic
+  - For station IDs / promos, label them as such
+  - Avoid generic placeholders like "Segment 1" if the content is recoverable
+
+Output ONLY the title string — no quotes, no JSON, no commentary."""

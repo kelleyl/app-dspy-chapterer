@@ -124,6 +124,24 @@ def appmetadata() -> AppMetadata:
         default=600.0,
         description="Per-request timeout for the LLM endpoint, in seconds.",
     )
+    metadata.add_parameter(
+        name="decoupledBoundaries",
+        type="boolean",
+        default=False,
+        description="Use the two-pass M5BoundariesRecipe: first LLM call emits "
+                    "an ordered list of chapter boundary timestamps, then a "
+                    "second per-chapter call generates the title from the "
+                    "in-range ASR / visual content. Default (False) keeps the "
+                    "single-shot M5GenerateRecipe.",
+    )
+    metadata.add_parameter(
+        name="skipTitling",
+        type="boolean",
+        default=False,
+        description="When `decoupledBoundaries=True`, skip the per-chapter title "
+                    "pass and emit empty `label` properties. Useful for "
+                    "boundary-only evaluation.",
+    )
 
     return metadata
 
