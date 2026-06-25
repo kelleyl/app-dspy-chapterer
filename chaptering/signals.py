@@ -61,6 +61,30 @@ def _video_fps(mmif: Mmif, default: float = DEFAULT_FPS) -> float:
     return default
 
 
+def _unwrap_text(val) -> str:
+    """Return the inner string of a MMIF text field, regardless of shape.
+
+    MMIF TextDocument `text` is sometimes a plain string, sometimes a dict
+    `{"@value": "...", "@language": ...}`, and sometimes a mmif-python
+    `Text` wrapper whose `.value` attribute holds the string."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    # mmif-python Text wrapper exposes the inner string as `.value`.
+    inner = getattr(val, "value", None)
+    if isinstance(inner, str):
+        return inner
+    # Fall back to dict-style lookup for raw {"@value": "..."}.
+    try:
+        inner = val.get("@value")
+        if isinstance(inner, str):
+            return inner
+    except (AttributeError, TypeError):
+        pass
+    return str(val)
+
+
 def _to_ms(value, unit: Optional[str], fps: float) -> int:
     """Convert a time value to milliseconds given its unit and the video fps."""
     if value is None:
@@ -100,11 +124,9 @@ def _extract_asr_from_view(view, fps: float) -> list[TimedItem]:
         atype = str(ann.at_type)
         props = ann.properties
         if "TextDocument" in atype:
-            text_val = props.get("text")
-            if isinstance(text_val, dict):
-                text_blob = text_val.get("@value", text_blob) or text_blob
-            elif isinstance(text_val, str):
-                text_blob = text_val
+            unwrapped = _unwrap_text(props.get("text"))
+            if unwrapped:
+                text_blob = unwrapped
         elif "TimeFrame" in atype:
             try:
                 tfs[_id(ann.id)] = (_to_ms(props["start"], tf_unit, fps),
@@ -213,8 +235,35 @@ def extract_shots(mmif: Mmif, fps: float) -> list[TimedItem]:
 
 
 def extract_visual_text(mmif: Mmif, fps: float) -> list[TimedItem]:
-    """Pull chyron/slate/credits OCR or per-shot caption text from any
-    view whose app produces them. Best-effort, missing views just skipped."""
+    """Pull per-shot captions / chyron OCR / slate OCR from any captioner
+    or OCR view. Handles two layouts:
+
+    1. **Self-contained** (older OCR-style views): annotations carry both
+       the timeframe and the text in the same TimeFrame/TimePoint.
+    2. **Aligned** (qwen3vl-captioner / smolvlm2-captioner): the view emits
+       only TextDocuments + Alignments; the time comes from a TimeFrame
+       (or TimePoint) in an upstream view (TransNet shots, SWT, etc.) that
+       the Alignment points at. This is the modern pattern.
+    """
+    # First pass: collect every TimeFrame/TimePoint across all views into
+    # a global lookup. Convert each one to ms using its view's declared
+    # timeUnit.
+    tf_index: dict[str, tuple[int, int]] = {}
+    for view in mmif.views:
+        tf_unit = _view_time_unit(view, "TimeFrame")
+        tp_unit = _view_time_unit(view, "TimePoint")
+        for ann in view.annotations:
+            atype = str(ann.at_type)
+            if "TimeFrame" not in atype and "TimePoint" not in atype:
+                continue
+            unit = tp_unit if "TimePoint" in atype else tf_unit
+            try:
+                start = _to_ms(ann.properties["start"], unit, fps)
+                end = _to_ms(ann.properties.get("end", ann.properties["start"]), unit, fps)
+            except (KeyError, TypeError, ValueError):
+                continue
+            tf_index[_id(ann.id)] = (start, end)
+
     out: list[TimedItem] = []
     for view in mmif.views:
         app = _normalize_app(view.metadata.app or "")
@@ -222,27 +271,50 @@ def extract_visual_text(mmif: Mmif, fps: float) -> list[TimedItem]:
             continue
         tf_unit = _view_time_unit(view, "TimeFrame")
         tp_unit = _view_time_unit(view, "TimePoint")
+
+        # Build a local map of TextDocument id → text for this view.
+        td_text: dict[str, str] = {}
+        for ann in view.annotations:
+            if "TextDocument" not in str(ann.at_type):
+                continue
+            text = _unwrap_text(ann.properties.get("text")).strip()
+            if text:
+                td_text[_id(ann.id)] = text
+
         for ann in view.annotations:
             atype = str(ann.at_type)
-            if "TextDocument" in atype:
+
+            # Layout 1: TimeFrame/TimePoint carries text directly.
+            if "TimeFrame" in atype or "TimePoint" in atype:
+                props = ann.properties
+                unit = tp_unit if "TimePoint" in atype else tf_unit
+                try:
+                    start = _to_ms(props["start"], unit, fps)
+                    end = _to_ms(props.get("end", props["start"]), unit, fps)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                text = (_unwrap_text(props.get("text"))
+                        or _unwrap_text(props.get("transcription"))
+                        or _unwrap_text(props.get("label"))).strip()
+                if not text:
+                    continue
+                out.append(TimedItem(start_ms=start, end_ms=end, text=text))
                 continue
-            if "TimeFrame" not in atype and "TimePoint" not in atype:
-                continue
-            props = ann.properties
-            unit = tp_unit if "TimePoint" in atype else tf_unit
-            try:
-                start = _to_ms(props["start"], unit, fps)
-                end = _to_ms(props.get("end", props["start"]), unit, fps)
-            except (KeyError, TypeError, ValueError):
-                continue
-            text = props.get("text") or props.get("transcription") or props.get("label") or ""
-            if isinstance(text, dict):
-                text = text.get("@value", "")
-            text = str(text or "").strip()
-            if not text:
-                continue
-            out.append(TimedItem(start_ms=start, end_ms=end, text=text))
-    out.sort(key=lambda x: x.start_ms)
+
+            # Layout 2: Alignment(source=upstream TimeFrame, target=local TextDocument).
+            if "Alignment" in atype:
+                props = ann.properties
+                src = _id(str(props.get("source", "")))
+                tgt = _id(str(props.get("target", "")))
+                # Try both directions: source could be the TimeFrame and
+                # target the TextDocument, or vice versa.
+                for tf_id, td_id in ((src, tgt), (tgt, src)):
+                    if tf_id in tf_index and td_id in td_text:
+                        start, end = tf_index[tf_id]
+                        out.append(TimedItem(start_ms=start, end_ms=end, text=td_text[td_id]))
+                        break
+
+    out.sort(key=lambda x: (x.start_ms, x.end_ms))
     return out
 
 
