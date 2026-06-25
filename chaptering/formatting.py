@@ -135,12 +135,33 @@ def _detect_pauses(
 
 def _detect_speaker_changes(
     segments: list[SpeakerSegment],
+    min_block_ms: int = 8000,
 ) -> list[tuple[int, str]]:
-    """For each speaker boundary, emit a `speaker change: SPEAKER_A -> SPEAKER_B` event."""
+    """Emit `speaker change` events on the boundaries between contiguous
+    same-speaker blocks. Suppresses events where the OUTGOING block is
+    shorter than `min_block_ms` — many diarizers (incl. VibeVoice) over-
+    segment, giving every utterance a fresh speaker id; filtering on
+    block duration removes that noise while keeping real anchor↔reporter
+    transitions."""
+    if not segments:
+        return []
+    # First pass: greedy block-merging by speaker id.
+    blocks: list[list[SpeakerSegment]] = [[segments[0]]]
+    for s in segments[1:]:
+        if s.speaker == blocks[-1][-1].speaker:
+            blocks[-1].append(s)
+        else:
+            blocks.append([s])
     out = []
-    for prev, nxt in zip(segments, segments[1:]):
-        if prev.speaker != nxt.speaker and prev.speaker and nxt.speaker:
-            out.append((nxt.start_ms, f"speaker change: {prev.speaker} -> {nxt.speaker}"))
+    for prev, nxt in zip(blocks, blocks[1:]):
+        prev_dur = prev[-1].end_ms - prev[0].start_ms
+        nxt_dur = nxt[-1].end_ms - nxt[0].start_ms
+        if prev_dur < min_block_ms or nxt_dur < min_block_ms:
+            continue
+        if not prev[-1].speaker or not nxt[0].speaker:
+            continue
+        out.append((nxt[0].start_ms,
+                    f"speaker change: {prev[-1].speaker} -> {nxt[0].speaker}"))
     return out
 
 
