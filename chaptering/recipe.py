@@ -25,7 +25,7 @@ from typing import Iterable
 import dspy
 from pydantic import BaseModel, Field
 
-from .formatting import format_timed_items_for_prompt
+from .formatting import compact_captions, format_timed_items_for_prompt
 from .prompts import BOUNDARY_INSTRUCTION, OPTIMIZED_INSTRUCTION, TITLING_INSTRUCTION
 from .snap import snap_boundaries_to_shots
 from .types import Chapter, TimedItem, VideoSignals
@@ -81,11 +81,11 @@ class M5GenerateRecipe(dspy.Module):
             return []
 
         asr_text = format_timed_items_for_prompt(signals.asr)
-        visual_text = format_timed_items_for_prompt(
-            list(signals.chyron_ocr)
-            + list(signals.visual_captions)
-            + list(signals.swt_timeframes)
-        )
+        captions = compact_captions(list(signals.chyron_ocr) + list(signals.visual_captions))
+        # `swt_timeframes` only carries "shot" labels — dropped here as
+        # raw shot-change rate is noise without semantic content; the
+        # snap-to-shot post-processing still uses these times.
+        visual_text = format_timed_items_for_prompt(captions)
 
         result = self.generate(
             duration_ms=signals.duration_ms,
@@ -234,11 +234,10 @@ class M5BoundariesRecipe(dspy.Module):
             return []
 
         asr_text = format_timed_items_for_prompt(signals.asr)
-        visual_text = format_timed_items_for_prompt(
-            list(signals.chyron_ocr)
-            + list(signals.visual_captions)
-            + list(signals.swt_timeframes)
-        )
+        captions = compact_captions(list(signals.chyron_ocr) + list(signals.visual_captions))
+        # Drop raw "shot" labels — see M5GenerateRecipe.forward for the
+        # rationale. swt_timeframes is still used for snap-to-shot.
+        visual_text = format_timed_items_for_prompt(captions)
 
         result = self.detect_boundaries(
             duration_ms=signals.duration_ms,
